@@ -3,7 +3,7 @@ import axios from 'axios';
 import { Link } from 'react-router-dom';
 import { Play, Globe, Settings, Clock, CheckCircle, XCircle, Loader } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = '/api';
 
 export default function Dashboard() {
   const [jobs, setJobs] = useState([]);

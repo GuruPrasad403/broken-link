@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import axios from 'axios';
 import { ArrowLeft, Download, FileSpreadsheet, FileJson, AlertTriangle, Link2, Code2, FileCode2, Terminal, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = '/api';
 
 const BRAND = { blue: '#0A74DA', pink: '#E91E63', cyan: '#00BCD4' };
 const TYPE_STYLES = {

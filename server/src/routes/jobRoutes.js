@@ -80,7 +80,9 @@ router.get('/:id/logs', (req, res) => {
 
   // Send a heartbeat comment every 15s to keep the connection alive
   const heartbeat = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch (_) {}
+    try { res.write(': heartbeat\n\n'); } catch (_) {
+      console.log(`Client disconnected from job ${jobId} logs stream`);
+    }
   }, 15000);
 
   registerListener(jobId, res);
