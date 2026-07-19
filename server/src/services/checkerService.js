@@ -1,14 +1,11 @@
 import got from 'got';
 import pLimit from 'p-limit';
-import { assetsDb, generateId } from './store.js';
+import { generateId } from './store.js';
 import { emitLog } from './logBus.js';
+import Asset from '../models/Asset.js';
 
 const limit = pLimit(20); // Max concurrent checks
 
-/**
- * Check a single asset URL.
- * Returns: true (broken), false (OK), null (already cached / skipped)
- */
 export const checkAsset = async (assetUrl, assetType, pageUrl, jobId, cache, timeout = 10000) => {
   if (cache.has(assetUrl)) {
     return null;
@@ -36,19 +33,15 @@ export const checkAsset = async (assetUrl, assetType, pageUrl, jobId, cache, tim
     };
 
     try {
-      // --- Step 1: HEAD request to get final status code after redirects ---
       let headResponse = await got.head(assetUrl, gotOptions);
       statusCode = headResponse.statusCode;
 
-      // Some servers block HEAD and return 403, 404, 405, etc. — fall back to GET
       if (statusCode >= 400) {
         const getResp = await got.get(assetUrl, gotOptions);
         statusCode = getResp.statusCode;
       }
 
-      // --- Step 2: If status is 4xx/5xx — definitively broken ---
       if (statusCode >= 400) {
-        // For CSS/JS only: do a body check to handle servers that serve real content with wrong status codes
         if (assetType === 'CSS' || assetType === 'JavaScript') {
           const getResp = await got.get(assetUrl, gotOptions);
           const contentType = getResp.headers['content-type'] || '';
@@ -56,7 +49,6 @@ export const checkAsset = async (assetUrl, assetType, pageUrl, jobId, cache, tim
           const isHtml = contentType.includes('text/html') || body.startsWith('<html') || body.startsWith('<!DOCTYPE');
           const isTinyError = body.length < 200 && /not found|404|forbidden|403|error/i.test(body);
 
-          // If body has real CSS/JS content (not HTML, not a tiny error message) → soft error, not broken
           if (body.length > 0 && !isHtml && !isTinyError) {
             return false;
           }
@@ -65,7 +57,6 @@ export const checkAsset = async (assetUrl, assetType, pageUrl, jobId, cache, tim
         isBroken = true;
         failureReason = `HTTP ${statusCode}`;
       }
-      // Status < 400 means it's working fine. (Soft 404 logic removed as per user request for true 404s only)
 
     } catch (error) {
       isBroken = true;
@@ -79,30 +70,33 @@ export const checkAsset = async (assetUrl, assetType, pageUrl, jobId, cache, tim
     }
 
     if (isBroken) {
-      if (statusCode === 404) {
+      const is404 = statusCode === 404;
+      if (is404) {
         emitLog(jobId, 'broken', `[BROKEN] ${assetType} → ${failureReason}: ${assetUrl}`, assetUrl, statusCode);
-        const assets = assetsDb.get(jobId);
-        if (assets) {
-          assets.push({
-            _id: generateId(),
-            jobId,
-            pageUrl,
-            assetUrl,
-            assetType,
-            statusCode,
-            failureReason,
-            createdAt: new Date()
-          });
-        }
-        return true;
       } else {
-        // Not a 404, so we log it as an error/info but do not save it as a broken link.
-        emitLog(jobId, 'error', `[ERROR] ${assetType} ignored (not 404, got ${statusCode || 'failure'}) → ${failureReason}: ${assetUrl}`, assetUrl, statusCode);
-        return false;
+        emitLog(jobId, 'error', `[ERROR] ${assetType} error (${statusCode || 'failure'}) → ${failureReason}: ${assetUrl}`, assetUrl, statusCode);
       }
+      
+      try {
+        const asset = new Asset({
+          _id: generateId(),
+          jobId,
+          pageUrl,
+          assetUrl,
+          assetType,
+          statusCode,
+          failureReason,
+          is404,
+          createdAt: new Date()
+        });
+        await asset.save();
+      } catch (err) {
+        console.error('Error saving asset:', err);
+      }
+      
+      return true; // Consider it broken (or errored) so it increments the count
     }
 
-    // Do not log [OK] for every working link on huge sites, to prevent memory crashes
     return false;
   });
 };

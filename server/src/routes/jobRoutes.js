@@ -1,15 +1,41 @@
 import express from 'express';
-import { jobsDb, assetsDb, generateId } from '../services/store.js';
+import { cleanupSession, generateId } from '../services/store.js';
 import { startCrawl } from '../services/crawlerService.js';
 import { generateCsvReport, generateExcelReport } from '../services/reportGenerator.js';
 import { registerListener, removeListener } from '../services/logBus.js';
+import Job from '../models/Job.js';
+import Asset from '../models/Asset.js';
 
 const router = express.Router();
 
-// Get all jobs
-router.get('/', (req, res) => {
+// Cleanup a session
+router.post('/cleanup', express.text({ type: '*/*' }), async (req, res) => {
   try {
-    const jobs = Array.from(jobsDb.values()).sort((a, b) => b.createdAt - a.createdAt);
+    let sessionId;
+    if (typeof req.body === 'string') {
+      try {
+        sessionId = JSON.parse(req.body).sessionId;
+      } catch (e) {
+        // Not JSON
+      }
+    } else {
+      sessionId = req.body?.sessionId;
+    }
+
+    if (sessionId) {
+      await cleanupSession(sessionId);
+    }
+    res.status(200).send('OK');
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all jobs for a session
+router.get('/', async (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'];
+    const jobs = await Job.find({ sessionId }).sort({ createdAt: -1 });
     res.json(jobs);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -17,16 +43,19 @@ router.get('/', (req, res) => {
 });
 
 // Create and start a new job
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   try {
-    const { url, depth = 0, concurrency = 10, timeout = 30000 } = req.body;
-    // `depth` – maximum crawl depth (0 = unlimited, otherwise limits pages ≈ depth × 100)
-    // `concurrency` – how many requests run in parallel (default 10).
+    const { url, depth = 0, concurrency = 10, timeout = 30000, verifyTags = true, expectedCookieId = '' } = req.body;
     const cleanUrl = url.trim();
     const jobId = generateId();
-    const job = {
+    const sessionId = req.headers['x-session-id'];
+    
+    const job = new Job({
       _id: jobId,
+      sessionId,
       url: cleanUrl,
+      verifyTags: Boolean(verifyTags),
+      expectedCookieId: expectedCookieId.trim(),
       depth: Number(depth),
       concurrency: Number(concurrency),
       timeout: Number(timeout),
@@ -35,12 +64,13 @@ router.post('/', (req, res) => {
       assetsChecked: 0,
       brokenAssetsCount: 0,
       createdAt: new Date()
-    };
-    jobsDb.set(jobId, job);
-    assetsDb.set(jobId, []);
+    });
+    await job.save();
 
     // Start crawl asynchronously
-    startCrawl(jobId);
+    startCrawl(jobId).catch(err => {
+      console.error('Background crawl task failed:', err);
+    });
 
     res.status(201).json(job);
   } catch (error) {
@@ -49,9 +79,9 @@ router.post('/', (req, res) => {
 });
 
 // Get a specific job
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   try {
-    const job = jobsDb.get(req.params.id);
+    const job = await Job.findById(req.params.id);
     if (!job) return res.status(404).json({ error: 'Job not found' });
     res.json(job);
   } catch (error) {
@@ -59,10 +89,31 @@ router.get('/:id', (req, res) => {
   }
 });
 
-// Get broken assets for a job
-router.get('/:id/assets', (req, res) => {
+// Delete a specific job and all its assets
+router.delete('/:id', async (req, res) => {
   try {
-    const assets = assetsDb.get(req.params.id) || [];
+    const job = await Job.findById(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    // Only allow deletion by the session that owns the job
+    const sessionId = req.headers['x-session-id'];
+    if (job.sessionId && job.sessionId !== sessionId) {
+      return res.status(403).json({ error: 'Not authorized to delete this job' });
+    }
+
+    await Asset.deleteMany({ jobId: req.params.id });
+    await Job.deleteOne({ _id: req.params.id });
+
+    res.status(200).json({ message: 'Job deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get broken assets for a job
+router.get('/:id/assets', async (req, res) => {
+  try {
+    const assets = await Asset.find({ jobId: req.params.id });
     res.json(assets);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -78,7 +129,6 @@ router.get('/:id/logs', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders();
 
-  // Send a heartbeat comment every 15s to keep the connection alive
   const heartbeat = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch (_) {
       console.log(`Client disconnected from job ${jobId} logs stream`);
@@ -97,7 +147,7 @@ router.get('/:id/logs', (req, res) => {
 router.get('/:id/download/:format', async (req, res) => {
   try {
     const { id, format } = req.params;
-    const job = jobsDb.get(id);
+    const job = await Job.findById(id);
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
     const filename = `broken-assets-${id}`;
@@ -113,7 +163,7 @@ router.get('/:id/download/:format', async (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
       return res.send(excelData);
     } else if (format === 'json') {
-      const assets = assetsDb.get(id) || [];
+      const assets = await Asset.find({ jobId: id });
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}.json"`);
       return res.json(assets);

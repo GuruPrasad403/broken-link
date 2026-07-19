@@ -1,11 +1,12 @@
 import { CheerioCrawler, Configuration } from 'crawlee';
-import { jobsDb, assetsDb } from './store.js';
-import { extractAssets } from './parserService.js';
+import { extractAssets, verifyPageTags } from './parserService.js';
 import { checkAsset } from './checkerService.js';
 import { emitLog, clearJobLogs } from './logBus.js';
+import Job from '../models/Job.js';
+import Asset from '../models/Asset.js';
 
 export const startCrawl = async (jobId) => {
-  const job = jobsDb.get(jobId);
+  const job = await Job.findById(jobId);
   if (!job) return;
 
   job.status = 'running';
@@ -13,9 +14,10 @@ export const startCrawl = async (jobId) => {
   job.pagesCrawled = 0;
   job.assetsChecked = 0;
   job.brokenAssetsCount = 0;
+  await job.save();
 
   // Clear any stale broken-asset records from a previous run of this job
-  assetsDb.set(jobId, []);
+  await Asset.deleteMany({ jobId });
 
   clearJobLogs(jobId); // Clear old logs for this job
 
@@ -25,11 +27,16 @@ export const startCrawl = async (jobId) => {
   let brokenAssetsCount = 0;
 
   const flushStats = async () => {
-    const jobToUpdate = jobsDb.get(jobId);
-    if (jobToUpdate) {
-      jobToUpdate.pagesCrawled = pagesCrawled;
-      jobToUpdate.assetsChecked = assetsChecked;
-      jobToUpdate.brokenAssetsCount = brokenAssetsCount;
+    try {
+      await Job.updateOne({ _id: jobId }, {
+        $set: {
+          pagesCrawled,
+          assetsChecked,
+          brokenAssetsCount
+        }
+      });
+    } catch (err) {
+      console.error('Error flushing stats:', err);
     }
   };
 
@@ -43,15 +50,11 @@ export const startCrawl = async (jobId) => {
       maxRequestsPerCrawl: job.depth > 0 ? job.depth * 100 : 10000,
       requestHandlerTimeoutSecs: (job.timeout / 1000) * 10,
       maxRequestRetries: 3,
-      // Enable a session so cookies are persisted across requests – many sites require a cookie to stop a 403.
       sessionPoolOptions: {
-
-        // Rotate user-agent per session for extra safety (fallback if needed)
         maxPoolSize: 10,
       },
       preNavigationHooks: [
         ({ request }) => {
-          // Set a realistic Chrome UA and other typical headers.
           request.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -60,12 +63,6 @@ export const startCrawl = async (jobId) => {
           };
         }
       ],
-      // Tell Crawlee not to treat a 403 as a blocked request that aborts the whole crawl.
-      // We'll still log it, but the crawler will continue processing other URLs.
-
-      // Keep logs concise for huge sites.
-      // Individual OK/skip logs are suppressed in checkerService.
-
       async requestHandler({ $, request, enqueueLinks, log }) {
         pagesCrawled++;
         const pageUrl = request.loadedUrl || request.url;
@@ -82,7 +79,6 @@ export const startCrawl = async (jobId) => {
           ...htmlLinks.map(url => ({ url, type: 'Page/Link' }))
         ];
 
-        // Process in chunks of 100 to act as a buffer and prevent memory/promise overflow
         const chunkSize = 100;
         for (let i = 0; i < allAssets.length; i += chunkSize) {
           const chunk = allAssets.slice(i, i + chunkSize);
@@ -97,6 +93,28 @@ export const startCrawl = async (jobId) => {
           await Promise.all(chunkPromises);
         }
         await flushStats();
+
+        // ── Tag Verification (runs independently of crawl asset checks) ───────
+        if (job.verifyTags) {
+          const tagIssues = verifyPageTags($.html(), pageUrl, job.expectedCookieId);
+          for (const issue of tagIssues) {
+            const { generateId } = await import('./store.js');
+            const tagAsset = new Asset({
+              _id: generateId(),
+              jobId,
+              pageUrl,
+              assetUrl: pageUrl,
+              assetType: 'Tag Issue',
+              statusCode: null,
+              failureReason: issue.detail,
+              is404: false,
+              tagIssueType: issue.issueType,
+              createdAt: new Date()
+            });
+            try { await tagAsset.save(); } catch (e) { console.error('Tag issue save error:', e); }
+            emitLog(jobId, 'error', `[TAG] ${issue.issueType.toUpperCase()} — ${pageUrl} — ${issue.detail}`, pageUrl);
+          }
+        }
 
         await enqueueLinks({
           strategy: 'same-domain',
@@ -117,15 +135,7 @@ export const startCrawl = async (jobId) => {
         }
 
         emitLog(jobId, 'error', `[FAIL] Crawler could not load: ${request.url} — ${errorMsg.slice(0, 120)}`, request.url);
-
-        brokenAssetsCount++;
-        
-        // Only log/record 404s, but here we don't have a status code, it's just a failure.
-        // The user explicitly requested "only true 404 pages", so we should NOT record general page failures as broken links anymore, unless we want to.
-        // Wait, the user said "I don't want only ture 404 pages" which meant "I want only true 404 pages".
-        // If the request fails entirely (e.g. timeout), it's not a 404. I will skip recording it as a broken asset to strictly follow "only 404".
-        
-        // Emit the error log but DO NOT save it to the database as a broken link.
+        // User requested not to record general page failures as broken assets
         
         await flushStats();
       },
@@ -134,16 +144,27 @@ export const startCrawl = async (jobId) => {
     await crawler.run([job.url]);
 
     emitLog(jobId, 'info', `[DONE] Crawl completed. Pages: ${pagesCrawled}, Checked: ${assetsChecked}, Broken: ${brokenAssetsCount}`);
-    job.status = 'completed';
+    await Job.updateOne({ _id: jobId }, {
+      $set: {
+        status: 'completed',
+        completedAt: new Date(),
+        pagesCrawled,
+        assetsChecked,
+        brokenAssetsCount
+      }
+    });
   } catch (error) {
     console.error('Crawler failed:', error);
     emitLog(jobId, 'error', `[ERROR] Crawler crashed: ${error.message}`);
-    job.status = 'failed';
-    job.errorMessage = error.message;
-  } finally {
-    job.completedAt = new Date();
-    job.pagesCrawled = pagesCrawled;
-    job.assetsChecked = assetsChecked;
-    job.brokenAssetsCount = brokenAssetsCount;
+    await Job.updateOne({ _id: jobId }, {
+      $set: {
+        status: 'failed',
+        errorMessage: error.message,
+        completedAt: new Date(),
+        pagesCrawled,
+        assetsChecked,
+        brokenAssetsCount
+      }
+    });
   }
 };

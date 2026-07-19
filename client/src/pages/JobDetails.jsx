@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import axios from 'axios';
+import api, { getSessionId } from '../api';
 import { ArrowLeft, Download, FileSpreadsheet, FileJson, AlertTriangle, Link2, Code2, FileCode2, Terminal, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 
-const API_BASE = '/api';
+const API_BASE = 'http://localhost:5000/api';
 
 const BRAND = { blue: '#0A74DA', pink: '#E91E63', cyan: '#00BCD4' };
 const TYPE_STYLES = {
@@ -29,13 +29,13 @@ const LOG_COLORS = {
 function ConsolePanel({ jobId, isRunning }) {
   const [logs, setLogs] = useState([]);
   const [open, setOpen] = useState(true);
-  const [autoScroll, setAutoScroll] = useState(true);
+  const [autoScroll, setAutoScroll] = useState(false); // Default to false based on user feedback
   const [filter, setFilter] = useState('all');
   const bottomRef = useRef(null);
   const containerRef = useRef(null);
 
   useEffect(() => {
-    const es = new EventSource(`${API_BASE}/jobs/${jobId}/logs`);
+    const es = new EventSource(`${API_BASE}/jobs/${jobId}/logs?sessionId=${getSessionId()}`);
     es.onmessage = (e) => {
       try {
         const entry = JSON.parse(e.data);
@@ -181,14 +181,17 @@ export default function JobDetails() {
   const [job, setJob] = useState(null);
   const [assets, setAssets] = useState([]);
   const [loading, setLoading] = useState(true);
+  
+  const [mainTab, setMainTab] = useState('broken'); // 'broken' | 'errors' | 'tags'
   const [filter, setFilter] = useState('All');
+  
   const jobStatusRef = useRef(null);
 
   const fetchJobData = async () => {
     try {
       const [jobRes, assetsRes] = await Promise.all([
-        axios.get(`${API_BASE}/jobs/${id}`),
-        axios.get(`${API_BASE}/jobs/${id}/assets`)
+        api.get(`/jobs/${id}`),
+        api.get(`/jobs/${id}/assets`)
       ]);
       const fetchedJob = jobRes.data;
       setJob(fetchedJob);
@@ -212,19 +215,36 @@ export default function JobDetails() {
     return () => clearInterval(interval);
   }, [id]);
 
-  const filteredAssets = filter === 'All' ? assets : assets.filter(a => a.assetType === filter);
+  // Tag Issues are a separate category — exclude them from broken/errors tabs
+  const tagIssuesList = assets.filter(a => a.assetType === 'Tag Issue');
+  const nonTagAssets = assets.filter(a => a.assetType !== 'Tag Issue');
+
+  const activeAssetsList = mainTab === 'broken'
+    ? nonTagAssets.filter(a => a.is404)
+    : mainTab === 'errors'
+    ? nonTagAssets.filter(a => !a.is404)
+    : tagIssuesList;
+
+  const filteredAssets = filter === 'All' ? activeAssetsList : activeAssetsList.filter(a => a.assetType === filter);
+  
   const counts = {
-    All: assets.length,
-    CSS: assets.filter(a => a.assetType === 'CSS').length,
-    JavaScript: assets.filter(a => a.assetType === 'JavaScript').length,
-    Image: assets.filter(a => a.assetType === 'Image').length,
-    'Page/Link': assets.filter(a => a.assetType === 'Page/Link').length,
+    All: activeAssetsList.length,
+    CSS: activeAssetsList.filter(a => a.assetType === 'CSS').length,
+    JavaScript: activeAssetsList.filter(a => a.assetType === 'JavaScript').length,
+    Image: activeAssetsList.filter(a => a.assetType === 'Image').length,
+    'Page/Link': activeAssetsList.filter(a => a.assetType === 'Page/Link').length,
   };
 
   if (loading && !job) return <div style={{ textAlign: 'center', padding: '3rem', color: '#94a3b8' }}>Loading job details...</div>;
   if (!job) return <div style={{ textAlign: 'center', padding: '3rem', color: '#ef4444' }}>Job not found</div>;
 
   const isRunning = job.status === 'running' || job.status === 'pending';
+  
+  const brokenCount = nonTagAssets.filter(a => a.is404).length;
+  const errorCount = nonTagAssets.filter(a => !a.is404).length;
+  const tagCount = tagIssuesList.length;
+  const cookieIssueCount = tagIssuesList.filter(a => a.tagIssueType === 'cookie').length;
+  const utagIssueCount = tagIssuesList.filter(a => a.tagIssueType === 'utag').length;
 
   return (
     <div>
@@ -241,7 +261,11 @@ export default function JobDetails() {
               <span>Status: <span className={`badge ${job.status}`}>{job.status}</span></span>
               <span>Pages Crawled: <strong>{job.pagesCrawled}</strong></span>
               <span>Assets Checked: <strong>{job.assetsChecked}</strong></span>
-              <span>Broken: <strong style={{ color: 'var(--danger)' }}>{job.brokenAssetsCount}</strong></span>
+              <span>Broken (404): <strong style={{ color: 'var(--danger)' }}>{brokenCount}</strong></span>
+              <span>Other Errors: <strong style={{ color: 'var(--warning)' }}>{errorCount}</strong></span>
+              {tagCount > 0 && (
+                <span>Tag Issues: <strong style={{ color: '#a78bfa' }}>{tagCount}</strong></span>
+              )}
             </div>
             {isRunning && (
               <div style={{ marginTop: '0.75rem', color: '#38bdf8', fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -279,74 +303,178 @@ export default function JobDetails() {
 
       {/* Live Console */}
       <ConsolePanel jobId={id} isRunning={isRunning} />
-
-      {/* Filter Tabs */}
-      <div style={{ display: 'flex', gap: '0.5rem', margin: '1.5rem 0 1rem', flexWrap: 'wrap' }}>
-        {['All', 'CSS', 'JavaScript', 'Image', 'Page/Link'].map(type => (
+      
+      {/* Main Tabs */}
+      <div style={{ display: 'flex', gap: '0', marginTop: '2rem', borderBottom: '1px solid var(--glass-border)' }}>
+        <button
+          onClick={() => { setMainTab('broken'); setFilter('All'); }}
+          style={{
+            background: 'none', border: 'none', padding: '0.75rem 1.5rem', cursor: 'pointer',
+            fontSize: '0.95rem', fontWeight: 600,
+            color: mainTab === 'broken' ? 'var(--primary)' : '#94a3b8',
+            borderBottom: mainTab === 'broken' ? '2px solid var(--primary)' : '2px solid transparent',
+            transition: 'all 0.2s'
+          }}
+        >
+          ❌ Broken Assets (404) <span style={{ fontSize: '0.78rem', opacity: 0.8 }}>({brokenCount})</span>
+        </button>
+        <button
+          onClick={() => { setMainTab('errors'); setFilter('All'); }}
+          style={{
+            background: 'none', border: 'none', padding: '0.75rem 1.5rem', cursor: 'pointer',
+            fontSize: '0.95rem', fontWeight: 600,
+            color: mainTab === 'errors' ? 'var(--warning)' : '#94a3b8',
+            borderBottom: mainTab === 'errors' ? '2px solid var(--warning)' : '2px solid transparent',
+            transition: 'all 0.2s'
+          }}
+        >
+          🔥 Other Errors (403, 500…) <span style={{ fontSize: '0.78rem', opacity: 0.8 }}>({errorCount})</span>
+        </button>
+        {job.verifyTags && (
           <button
-            key={type}
-            onClick={() => setFilter(type)}
+            onClick={() => { setMainTab('tags'); setFilter('All'); }}
             style={{
-              padding: '0.4rem 1rem', borderRadius: '999px', border: '1px solid',
-              cursor: 'pointer', fontWeight: 500, fontSize: '0.85rem', transition: 'all 0.2s',
-              borderColor: filter === type ? 'var(--primary)' : 'var(--glass-border)',
-              background: filter === type ? 'rgba(99,102,241,0.2)' : 'rgba(255,255,255,0.04)',
-              color: filter === type ? '#818cf8' : '#94a3b8',
+              background: 'none', border: 'none', padding: '0.75rem 1.5rem', cursor: 'pointer',
+              fontSize: '0.95rem', fontWeight: 600,
+              color: mainTab === 'tags' ? '#a78bfa' : '#94a3b8',
+              borderBottom: mainTab === 'tags' ? '2px solid #a78bfa' : '2px solid transparent',
+              transition: 'all 0.2s'
             }}
           >
-            {type} <span style={{ opacity: 0.7 }}>({counts[type]})</span>
+            🏷️ Tag Issues <span style={{ fontSize: '0.78rem', opacity: 0.8 }}>({tagCount})</span>
           </button>
-        ))}
+        )}
       </div>
 
-      {/* Broken Assets Table */}
+      {/* Filter Tabs — only for broken & errors tabs, not tags */}
+      {mainTab !== 'tags' && (
+        <div style={{ display: 'flex', gap: '0.5rem', margin: '1.5rem 0 1rem', flexWrap: 'wrap' }}>
+          {['All', 'CSS', 'JavaScript', 'Image', 'Page/Link'].map(type => (
+            <button
+              key={type}
+              onClick={() => setFilter(type)}
+              style={{
+                padding: '0.4rem 1rem', borderRadius: '999px', border: '1px solid',
+                cursor: 'pointer', fontWeight: 500, fontSize: '0.85rem', transition: 'all 0.2s',
+                borderColor: filter === type ? 'var(--primary)' : 'var(--glass-border)',
+                background: filter === type ? 'rgba(99,102,241,0.2)' : 'rgba(255,255,255,0.04)',
+                color: filter === type ? '#818cf8' : '#94a3b8',
+              }}
+            >
+              {type} <span style={{ opacity: 0.7 }}>({counts[type]})</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {mainTab === 'tags' && (
+        <div style={{ display: 'flex', gap: '0.5rem', margin: '1.5rem 0 1rem', flexWrap: 'wrap', alignItems: 'center' }}>
+          <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Summary:</span>
+          <span style={{ padding: '0.25rem 0.75rem', borderRadius: '999px', fontSize: '0.78rem', background: 'rgba(167,139,250,0.15)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.3)' }}>
+            🍪 Cookie Issues: {cookieIssueCount}
+          </span>
+          <span style={{ padding: '0.25rem 0.75rem', borderRadius: '999px', fontSize: '0.78rem', background: 'rgba(251,191,36,0.15)', color: '#fbbf24', border: '1px solid rgba(251,191,36,0.3)' }}>
+            📦 Utag Issues: {utagIssueCount}
+          </span>
+        </div>
+      )}
+
+      {/* Assets / Tag Issues Table */}
       <div className="glass-panel">
-        <h3 style={{ marginTop: 0 }}>Broken Assets — {filter} ({filteredAssets.length})</h3>
-        {filteredAssets.length === 0 ? (
-          <p style={{ color: '#94a3b8' }}>
-            {assets.length === 0
-              ? (isRunning ? 'Crawling... broken assets will appear here.' : 'No broken assets found — great news!')
-              : `No broken assets of type "${filter}".`
-            }
-          </p>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th style={{ minWidth: 200 }}>Page URL</th>
-                  <th style={{ minWidth: 200 }}>Broken Asset / Link URL</th>
-                  <th>Type</th>
-                  <th>Failure Reason</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredAssets.map(asset => {
-                  const typeStyle = TYPE_STYLES[asset.assetType] || TYPE_STYLES['CSS'];
-                  return (
-                    <tr key={asset._id}>
-                      <td style={{ maxWidth: '300px', wordBreak: 'break-all', fontSize: '0.8rem' }}>
-                        <a href={asset.pageUrl} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>{asset.pageUrl}</a>
-                      </td>
-                      <td style={{ maxWidth: '300px', wordBreak: 'break-all', fontSize: '0.8rem' }}>
-                        <a href={asset.assetUrl} target="_blank" rel="noreferrer" style={{ color: '#f472b6' }}>{asset.assetUrl}</a>
-                      </td>
-                      <td>
-                        <span className="badge" style={{ background: typeStyle.bg, color: typeStyle.color, display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                          {typeStyle.icon} {asset.assetType}
-                        </span>
-                      </td>
-                      <td>
-                        <span style={{ color: 'var(--danger)', fontWeight: 500, fontSize: '0.85rem' }}>
-                          {asset.failureReason || (asset.statusCode ? `HTTP ${asset.statusCode}` : 'Unknown')}
-                        </span>
-                      </td>
+        {mainTab === 'tags' ? (
+          <>
+            <h3 style={{ marginTop: 0 }}>🏷️ Tag Issues ({tagIssuesList.length})</h3>
+            {tagIssuesList.length === 0 ? (
+              <p style={{ color: '#94a3b8' }}>
+                {isRunning ? 'Crawling... tag issues will appear here if found.' : '✅ No tag issues found — all pages have the correct Cookie ID and Utag prod!'}
+              </p>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th style={{ minWidth: 250 }}>Page URL</th>
+                      <th>Issue Type</th>
+                      <th>Detail</th>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                  </thead>
+                  <tbody>
+                    {tagIssuesList.map(issue => (
+                      <tr key={issue._id}>
+                        <td style={{ maxWidth: '400px', wordBreak: 'break-all', fontSize: '0.8rem' }}>
+                          <a href={issue.pageUrl} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>{issue.pageUrl}</a>
+                        </td>
+                        <td>
+                          {issue.tagIssueType === 'cookie' ? (
+                            <span className="badge" style={{ background: 'rgba(167,139,250,0.2)', color: '#a78bfa' }}>🍪 Cookie ID</span>
+                          ) : issue.tagIssueType === 'utag' ? (
+                            <span className="badge" style={{ background: 'rgba(251,191,36,0.2)', color: '#fbbf24' }}>📦 Utag</span>
+                          ) : (
+                            <span className="badge" style={{ background: 'rgba(148,163,184,0.2)', color: '#94a3b8' }}>Unknown</span>
+                          )}
+                        </td>
+                        <td style={{ fontSize: '0.85rem', color: '#cbd5e1', maxWidth: '500px', wordBreak: 'break-word' }}>
+                          {issue.failureReason}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <h3 style={{ marginTop: 0 }}>
+              {mainTab === 'broken' ? 'Broken Assets (404)' : 'Other Errors'} — {filter} ({filteredAssets.length})
+            </h3>
+            {filteredAssets.length === 0 ? (
+              <p style={{ color: '#94a3b8' }}>
+                {activeAssetsList.length === 0
+                  ? (isRunning ? 'Crawling... items will appear here.' : 'No items found — great news!')
+                  : `No items of type "${filter}".`
+                }
+              </p>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th style={{ minWidth: 200 }}>Page URL</th>
+                      <th style={{ minWidth: 200 }}>Asset / Link URL</th>
+                      <th>Type</th>
+                      <th>Status / Failure Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredAssets.map(asset => {
+                      const typeStyle = TYPE_STYLES[asset.assetType] || TYPE_STYLES['CSS'];
+                      return (
+                        <tr key={asset._id}>
+                          <td style={{ maxWidth: '300px', wordBreak: 'break-all', fontSize: '0.8rem' }}>
+                            <a href={asset.pageUrl} target="_blank" rel="noreferrer" style={{ color: '#60a5fa' }}>{asset.pageUrl}</a>
+                          </td>
+                          <td style={{ maxWidth: '300px', wordBreak: 'break-all', fontSize: '0.8rem' }}>
+                            <a href={asset.assetUrl} target="_blank" rel="noreferrer" style={{ color: '#f472b6' }}>{asset.assetUrl}</a>
+                          </td>
+                          <td>
+                            <span className="badge" style={{ background: typeStyle.bg, color: typeStyle.color, display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                              {typeStyle.icon} {asset.assetType}
+                            </span>
+                          </td>
+                          <td>
+                            <span style={{ color: mainTab === 'broken' ? 'var(--danger)' : 'var(--warning)', fontWeight: 500, fontSize: '0.85rem' }}>
+                              {asset.failureReason || (asset.statusCode ? `HTTP ${asset.statusCode}` : 'Unknown')}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
