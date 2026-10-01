@@ -19,6 +19,7 @@ export const extractAssets = (html, baseUrl) => {
         resolvedUrl.hash = '';
         return resolvedUrl.href;
       } catch (err) {
+        console.log(err)
         return null;
       }
     };
